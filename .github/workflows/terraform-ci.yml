@@ -1,0 +1,146 @@
+name: Terraform CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform:
+    name: Terraform checks
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.6"
+          terraform_wrapper: false
+
+      - name: Verify Terraform version
+        run: terraform version
+
+      - name: Check prohibited tracked files
+        run: |
+          python3 <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+
+          files = subprocess.check_output(
+              ["git", "ls-files", "-z"]
+          ).decode().split("\0")
+
+          violations = []
+
+          for filename in filter(None, files):
+              path = PurePosixPath(filename)
+              name = path.name
+
+              if (
+                  ".terraform" in path.parts
+                  or any(
+                      part in path.parts
+                      for part in (
+                          "credentials",
+                          "secrets",
+                          "private"
+                      )
+                  )
+                  or ".tfstate" in name
+                  or name.startswith(".env")
+                  or name.endswith((
+                      ".tfplan",
+                      ".tfvars",
+                      ".tfvars.json",
+                      ".tfbackend",
+                      ".pem",
+                      ".key"
+                  ))
+                  or name in (
+                      "tfplan",
+                      "plan.out",
+                      ".terraformrc",
+                      "terraform.rc"
+                  )
+              ):
+                  violations.append(filename)
+
+          if violations:
+              for filename in violations:
+                  print(f"Prohibited tracked file: {filename}")
+
+              raise SystemExit(
+                  "FAIL: Prohibited files detected"
+              )
+
+          print("PASS: No prohibited tracked files")
+          PY
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize server profile module
+        working-directory: modules/server-profile
+        run: terraform init -backend=false -no-color
+
+      - name: Validate server profile module
+        working-directory: modules/server-profile
+        run: terraform validate -no-color
+
+      - name: Run module tests
+        working-directory: modules/server-profile
+        run: terraform test -no-color
+
+      - name: Initialize example configuration
+        working-directory: examples/server-profile
+        run: terraform init -backend=false -no-color
+
+      - name: Validate example configuration
+        working-directory: examples/server-profile
+        run: terraform validate -no-color
+
+      - name: Verify example plan
+        working-directory: examples/server-profile
+        run: terraform plan -input=false -no-color
+
+      - name: Publish verification summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          # Terraform CI Verification
+
+          | Control | Result |
+          |---|---|
+          | Terraform installation | PASS |
+          | Prohibited file detection | PASS |
+          | Code formatting | PASS |
+          | Module validation | PASS |
+          | Automated module tests | PASS |
+          | Example validation | PASS |
+          | Example plan | PASS |
+
+          No infrastructure resources were provisioned.
+
+          No remote state backend was required.
+          SUMMARY
